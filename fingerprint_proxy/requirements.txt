@@ -1,3 +1,6 @@
 mitmproxy>=10
 curl-cffi>=0.7
 requests>=2.31
+
+# Opcional (JavaScript con navegador real)
+playwright>=1.40

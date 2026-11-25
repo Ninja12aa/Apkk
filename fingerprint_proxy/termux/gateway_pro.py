@@ -17,11 +17,14 @@ Variables de entorno:
   PROFILES       huellas en orden de preferencia (por defecto una lista razonable)
   MAX_TRIES      intentos por peticion (por defecto 5)
   MIN_DELAY / MAX_DELAY  pausa entre peticiones al mismo sitio, en segundos (0.3 / 1.2)
+  JS_MODE        auto (por defecto: navegador si todo falla) | always | off
+  BROWSER_PATH   ejecutable de Chromium (opcional); JS_TIMEOUT segundos para el desafio
   HOST / PORT    127.0.0.1 / 8080
   STATE_FILE     state.json
 
 Uso:
   GET|POST http://127.0.0.1:8080/fetch?url=<URL-codificada>[&profile=chrome124][&tries=3]
+                 [&js=1 fuerza navegador | js=0 lo desactiva][&wait_for=<selector css>][&wait_ms=2000]
   GET      http://127.0.0.1:8080/stats
   GET      http://127.0.0.1:8080/health
 Las respuestas incluyen X-Gateway-Profile, X-Gateway-Tries y X-Gateway-Blocked.
@@ -37,6 +40,8 @@ from urllib.parse import parse_qs, urlparse
 
 from curl_cffi import requests
 
+from browser_worker import BrowserWorker
+
 DEFAULT_PROFILES = [
     "chrome131", "chrome124", "chrome123", "chrome120",
     "safari18_0", "safari17_0", "firefox133", "edge101",
@@ -48,6 +53,7 @@ MAX_DELAY = float(os.getenv("MAX_DELAY", "1.2"))
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8080"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
+JS_MODE = os.getenv("JS_MODE", "auto")  # auto | always | off
 EPSILON = 0.1  # probabilidad de probar una huella distinta a la mejor
 
 BLOCK_STATUS = {401, 403, 407, 429, 503}
@@ -151,18 +157,49 @@ def polite_wait(host):
         time.sleep(wait)
 
 
+def looks_blocked_html(body):
+    head = body[:20000].lower()
+    return any(m in head for m in BLOCK_MARKERS)
+
+
+browser = BrowserWorker(looks_blocked_html)
+
+
+class BrowserResp:
+    """Imita lo minimo de una respuesta de curl_cffi."""
+    def __init__(self, d):
+        self.status_code = d["status"]
+        self.content = d["body"]
+        self.headers = {"content-type": d["content_type"]}
+
+
+def render_with_browser(url, host, wait_for=None, wait_ms=0):
+    proxy = PROXIES[pick_proxy(host)]
+    d = browser.render(url, proxy, wait_for, wait_ms)
+    return BrowserResp(d), {"profile": "browser", "blocked": d["blocked"], "cleared": d["cleared"]}
+
+
 def is_blocked(resp):
     if resp.status_code in BLOCK_STATUS:
         return True
     ctype = resp.headers.get("content-type", "")
     if "html" in ctype or "text" in ctype:
-        head = resp.content[:20000].lower()
-        return any(m in head for m in BLOCK_MARKERS)
+        return looks_blocked_html(resp.content)
     return False
 
 
-def fetch(method, url, headers, body, forced_profile=None, tries=MAX_TRIES):
+def fetch(method, url, headers, body, forced_profile=None, tries=MAX_TRIES, js=None,
+          wait_for=None, wait_ms=0):
     host = urlparse(url).netloc
+    mode = js or JS_MODE  # "always" | "auto" | "off"
+    can_js = method == "GET" and mode != "off" and browser.available()
+    if can_js and mode == "always":
+        try:
+            r, info = render_with_browser(url, host, wait_for, wait_ms)
+            info["tries"] = 0
+            return r, info
+        except Exception as e:
+            return None, {"error": f"navegador: {e}", "tries": 0}
     tried, last, last_info = [], None, {}
     for attempt in range(1, tries + 1):
         profile = forced_profile or (rank(host, exclude=tried) or PROFILES)[0]
@@ -202,6 +239,13 @@ def fetch(method, url, headers, body, forced_profile=None, tries=MAX_TRIES):
         time.sleep(wait + random.random() * 0.5)
     last_info.setdefault("tries", tries)
     last_info["blocked"] = True
+    if can_js:  # ultimo recurso: ejecutar el JavaScript en un navegador real
+        try:
+            r, info = render_with_browser(url, host, wait_for, wait_ms)
+            info["tries"] = last_info["tries"]
+            return r, info
+        except Exception as e:
+            last_info["browser_error"] = str(e)
     return last, last_info
 
 
@@ -227,7 +271,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/stats":
             with lock:
                 return self._json(200, {"profiles": PROFILES, "bad_profiles": sorted(bad_profiles),
-                                        "proxies": len(PROXIES), "scores": state["scores"]})
+                                        "proxies": len(PROXIES), "js_mode": JS_MODE,
+                                        "browser_available": browser.available(), "scores": state["scores"]})
         if u.path != "/fetch":
             return self._json(404, {"error": "usa /fetch?url=..., /stats o /health"})
         qs = parse_qs(u.query)
@@ -239,13 +284,17 @@ class Handler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in SKIP_REQ and not k.lower().startswith("sec-ch-")}
         tries = int((qs.get("tries") or [MAX_TRIES])[0])
-        r, info = fetch(self.command, target, headers, body, (qs.get("profile") or [None])[0], tries)
+        js = (qs.get("js") or [None])[0]
+        js = {"1": "always", "0": "off"}.get(js, js)
+        r, info = fetch(self.command, target, headers, body, (qs.get("profile") or [None])[0], tries,
+                        js, (qs.get("wait_for") or [None])[0], int((qs.get("wait_ms") or [0])[0]))
         if r is None:
             return self._json(502, {"error": info.get("error", "sin respuesta"), **info})
         extra = [(k, v) for k, v in r.headers.items() if k.lower() not in SKIP_RESP]
         extra += [("X-Gateway-Profile", str(info.get("profile"))),
                   ("X-Gateway-Tries", str(info.get("tries"))),
-                  ("X-Gateway-Blocked", "1" if info.get("blocked") else "0")]
+                  ("X-Gateway-Blocked", "1" if info.get("blocked") else "0"),
+                  ("X-Gateway-JS", "1" if info.get("profile") == "browser" else "0")]
         self._send(r.status_code, r.content, extra)
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = _handle
