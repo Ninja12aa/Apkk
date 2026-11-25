@@ -14,7 +14,7 @@ Que hace:
 Variables de entorno:
   PROXIES        lista separada por comas: http://u:p@host:puerto,http://u:p@host2:puerto
   PROXIES_FILE   fichero con un proxy por linea (alternativa)
-  PROFILES       huellas en orden de preferencia (por defecto una lista razonable)
+  PROFILES       huellas en orden de preferencia (por defecto chrome124, safari18_0, safari17_0)
   MAX_TRIES      intentos por peticion (por defecto 5)
   MIN_DELAY / MAX_DELAY  pausa entre peticiones al mismo sitio, en segundos (0.3 / 1.2)
   JS_MODE        auto (por defecto: navegador si todo falla) | always | off
@@ -42,10 +42,12 @@ from curl_cffi import requests
 
 from browser_worker import BrowserWorker
 
-DEFAULT_PROFILES = [
-    "chrome131", "chrome124", "chrome123", "chrome120",
-    "safari18_0", "safari17_0", "firefox133", "edge101",
-]
+try:  # proxy base: proxy_config.py (no se sube a git); PROXIES/PROXIES_FILE lo sustituyen
+    from proxy_config import PROXIES as CONFIG_PROXIES
+except ImportError:
+    CONFIG_PROXIES = []
+
+DEFAULT_PROFILES = ["chrome124", "safari18_0", "safari17_0"]
 PROFILES = [p.strip() for p in os.getenv("PROFILES", ",".join(DEFAULT_PROFILES)).split(",") if p.strip()]
 MAX_TRIES = int(os.getenv("MAX_TRIES", "5"))
 MIN_DELAY = float(os.getenv("MIN_DELAY", "0.3"))
@@ -73,7 +75,7 @@ def load_proxies():
     path = os.getenv("PROXIES_FILE")
     if path and os.path.exists(path):
         items += [l.strip() for l in open(path) if l.strip() and not l.startswith("#")]
-    return items or [None]  # None = conexion directa
+    return items or list(CONFIG_PROXIES) or [None]  # None = conexion directa
 
 
 PROXIES = load_proxies()
